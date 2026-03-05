@@ -3,9 +3,10 @@
 # Copyright (C) 2019-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging
+import math, logging
 import stepper
 from . import force_move
+from enum import Enum
 
 class ManualStepper:
     def __init__(self, config):
@@ -29,7 +30,7 @@ class ManualStepper:
         # Setup iterative solver
         self.motion_queuing = self.printer.load_object(config, 'motion_queuing')
         self.trapq = self.motion_queuing.allocate_trapq()
-        self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        self.trapq_append = self.trapq_append_helper
         self.rail.setup_itersolve('cartesian_stepper_alloc', b'x')
         self.rail.set_trapq(self.trapq)
         # Registered with toolhead as an axtra axis
@@ -42,6 +43,9 @@ class ManualStepper:
         gcode.register_mux_command('MANUAL_STEPPER', "STEPPER",
                                    stepper_name, self.cmd_MANUAL_STEPPER,
                                    desc=self.cmd_MANUAL_STEPPER_help)
+    def trapq_append_helper(self, *args, **kwargs):
+        print(f">>>>>>>>>> Calling trapq_append with: {args}")
+        return self.motion_queuing.lookup_trapq_append()(*args, **kwargs)
     def get_name(self):
         return self.name
     def sync_print_time(self):
@@ -51,6 +55,13 @@ class ManualStepper:
             toolhead.dwell(self.next_cmd_time - print_time)
         else:
             self.next_cmd_time = print_time
+    def get_toolhead_last_move_time(self):
+        return self.printer.lookup_object('toolhead').get_last_move_time()
+    def sync_toolhead_next_move_time(self):
+        # only set if next_cmd_time is in the future
+        if self.next_cmd_time > self.get_toolhead_last_move_time():
+            toolhead = self.printer.lookup_object('toolhead')
+            toolhead.dwell(self.next_cmd_time - self.get_toolhead_last_move_time())
     def do_enable(self, enable):
         stepper_names = [s.get_name() for s in self.steppers]
         stepper_enable = self.printer.lookup_object('stepper_enable')
@@ -60,24 +71,102 @@ class ManualStepper:
         toolhead.flush_step_generation()
         self.commanded_pos = setpos
         self.rail.set_position([self.commanded_pos, 0., 0.])
-    def _submit_move(self, movetime, movepos, speed, accel):
-        cp = self.commanded_pos
-        dist = movepos - cp
-        axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
-            dist, speed, accel)
-        self.trapq_append(self.trapq, movetime,
-                          accel_t, cruise_t, accel_t,
-                          cp, 0., 0., axis_r, 0., 0.,
-                          0., cruise_v, accel)
-        self.commanded_pos = movepos
-        return movetime + accel_t + cruise_t + accel_t
-    def do_move(self, movepos, speed, accel, sync=True):
-        self.sync_print_time()
-        self.next_cmd_time = self._submit_move(self.next_cmd_time, movepos,
-                                               speed, accel)
+    def _submit_move(self, move_start_time, end_pos, speed, accel, sync, easing):
+        def move_constant_speed(dist):
+            return force_move.calc_move_time(dist, speed, 0)
+        
+        def move_accel_once(dist, max_speed):
+            nonlocal speed
+            axis_ratio = 1.
+            if dist < 0.:
+                axis_ratio = -1.
+                dist = -dist
+            if not accel or not dist:
+                return axis_r, 0., dist / max_speed, max_speed
+
+            max_cruise_v2 = dist * accel
+            if max_cruise_v2 < max_speed**2:
+                max_speed = math.sqrt(max_cruise_v2)
+
+            accel_time = max_speed / accel
+            accel_dist = (accel_time * max_speed) / 2.
+            cruise_time = (dist - accel_dist) / max_speed
+            return axis_ratio, accel_time, cruise_time, max_speed
+
+        if sync == "AFTER_PREV":
+            move_start_time = self.get_toolhead_last_move_time()
+
+        start_pos = self.commanded_pos
+        move_dist = end_pos - start_pos
+
+        print(f">>>>>>>>>> cp:{start_pos} dist:{move_dist}")
+        # this is only allowed during constant speed travel
+        if sync == "WITH_PREV" and not easing:
+            print(f">>>>>>>>>> synchronising move with previous G1 command")
+            toolhead_last_move_time = self.get_toolhead_last_move_time()
+            toolhead_move_time = toolhead_last_move_time - move_start_time
+
+            # try to do constant v move
+            axis_r, accel_t, cruise_t, cruise_v = move_constant_speed(move_dist)
+            manual_move_time = accel_t*2 + cruise_t
+            
+            if toolhead_move_time <= manual_move_time:
+                print(">>>>>>>>>> constant v")
+                self.trapq_append(self.trapq, move_start_time,
+                                  0, cruise_t, 0,
+                                  start_pos, 0., 0., axis_r, 0., 0.,
+                                  0., cruise_v, 0)
+                return move_start_time + cruise_t
+            else:
+                print(">>>>>>>>>> decel accel")
+                # recalc timings for half distance move with acceleration
+                axis_r, accel_t, cruise_t, cruise_v = move_accel_once(move_dist / 2, speed)
+                half_segment_t = cruise_t + accel_t
+                dwell_t = max(toolhead_move_time - half_segment_t*2, 0)
+                self.trapq_append(self.trapq, move_start_time,
+                                  0, cruise_t, accel_t,
+                                  start_pos, 0., 0., axis_r, 0., 0.,
+                                  cruise_v, cruise_v, accel)
+                self.trapq_append(self.trapq, move_start_time + half_segment_t + dwell_t,
+                                  accel_t, cruise_t, 0,
+                                  start_pos + move_dist / 2, 0., 0., axis_r, 0., 0.,
+                                  0, cruise_v, accel)
+                return move_start_time + half_segment_t + dwell_t + half_segment_t
+        else:
+            print(">>>>>>>>>> not synchronising move with previous G1 command")
+            if easing == "BEGIN":
+                print(">>>>>>>>>> easing=BEGIN")
+                axis_r, accel_t, cruise_t, cruise_v = move_accel_once(move_dist, speed)
+                self.trapq_append(self.trapq, move_start_time,
+                                  accel_t, cruise_t, 0,
+                                  start_pos, 0., 0., axis_r, 0., 0.,
+                                  0., cruise_v, accel)
+                return move_start_time + accel_t + cruise_t
+            if easing == "END":
+                print(">>>>>>>>>> easing=END")
+                axis_r, accel_t, cruise_t, cruise_v = move_accel_once(move_dist, speed)
+                self.trapq_append(self.trapq, move_start_time,
+                                  0, cruise_t, accel_t,
+                                  start_pos, 0., 0., axis_r, 0., 0.,
+                                  cruise_v, cruise_v, accel)
+                return move_start_time + accel_t + cruise_t
+            else: # cruising only
+                print(">>>>>>>>>> easing=None")
+                axis_r, accel_t, cruise_t, cruise_v = move_constant_speed(move_dist)
+                self.trapq_append(self.trapq, move_start_time,
+                                  0, cruise_t, 0,
+                                  start_pos, 0., 0., axis_r, 0., 0.,
+                                  0., cruise_v, 0)
+                return move_start_time + cruise_t
+    def do_move(self, movepos, speed, accel, sync, easing):
+        # sanity check
+        if self.next_cmd_time == 0:
+            self.next_cmd_time = self.get_toolhead_last_move_time()
+
+        self.next_cmd_time = self._submit_move(self.next_cmd_time, movepos, speed, accel, sync, easing)
         self.motion_queuing.note_mcu_movequeue_activity(self.next_cmd_time)
-        if sync:
-            self.sync_print_time()
+        self.commanded_pos = movepos
+        self.sync_toolhead_next_move_time()
     def do_homing_move(self, movepos, speed, accel,
                        probe_pos, triggered, check_trigger):
         if not self.can_home:
@@ -131,8 +220,9 @@ class ManualStepper:
             if ((self.pos_min is not None and movepos < self.pos_min)
                 or (self.pos_max is not None and movepos > self.pos_max)):
                 raise gcmd.error("Move out of range")
-            sync = gcmd.get_int('SYNC', 1)
-            self.do_move(movepos, speed, accel, sync)
+            sync = gcmd.get('SYNC', None)
+            easing = gcmd.get('EASING', None)
+            self.do_move(movepos, speed, accel, sync, easing)
         elif gcmd.get_int('SYNC', 0):
             self.sync_print_time()
     # Register as a gcode axis
@@ -207,22 +297,22 @@ class ManualStepper:
         return [self.commanded_pos, 0., 0., 0.]
     def set_position(self, newpos, homing_axes=""):
         self.do_set_position(newpos[0])
-    def get_last_move_time(self):
-        self.sync_print_time()
-        return self.next_cmd_time
+    # def get_last_move_time(self):
+    #     self.sync_print_time()
+    #     return self.next_cmd_time
     def dwell(self, delay):
         self.next_cmd_time += max(0., delay)
-    def drip_move(self, newpos, speed, drip_completion):
-        # Submit move to trapq
-        self.sync_print_time()
-        start_time = self.next_cmd_time
-        end_time = self._submit_move(start_time, newpos[0],
-                                     speed, self.homing_accel)
-        # Drip updates to motors
-        self.motion_queuing.drip_update_time(start_time, end_time,
-                                             drip_completion)
-        # Clear trapq of any remaining parts of movement
-        self.motion_queuing.wipe_trapq(self.trapq)
+    # def drip_move(self, newpos, speed, drip_completion):
+    #     # Submit move to trapq
+    #     self.sync_print_time()
+    #     start_time = self.next_cmd_time
+    #     end_time = self._submit_move(start_time, newpos[0],
+    #                                  speed, self.homing_accel)
+    #     # Drip updates to motors
+    #     self.motion_queuing.drip_update_time(start_time, end_time,
+    #                                          drip_completion)
+    #     # Clear trapq of any remaining parts of movement
+    #     self.motion_queuing.wipe_trapq(self.trapq)
     def get_kinematics(self):
         return self
     def get_steppers(self):
